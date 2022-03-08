@@ -622,7 +622,7 @@ static void* http_worker(void* arg) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data_size);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
 
-        syslog(LOG_NOTICE, "HTTP(%d): Sending %zd bytes to %s", info->worker_num, data_size, httpconfig->post_url);
+        syslog(LOG_DEBUG, "HTTP(%d): Sending %zd bytes to %s", info->worker_num, data_size, httpconfig->post_url);
         /* Do it! */
         CURLcode rcurl = curl_easy_perform(curl);
         long http_code = 0;
