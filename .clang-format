@@ -1,0 +1,10 @@
+AlignAfterOpenBracket: Align
+AllowShortBlocksOnASingleLine: Always
+BreakBeforeBraces: Attach
+IndentWidth: 4
+TabWidth: 1
+UseTab: Never
+PointerAlignment: Left
+ColumnLimit: 100
+BraceWrapping:
+  AfterCaseLabel: true
