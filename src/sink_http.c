@@ -128,6 +128,23 @@ static int check_elide(struct cb_info* info, char* full_name, double value) {
 static int add_metrics(void* data, metric_type type, char* name, void* value) {
     struct cb_info* info = (struct cb_info*)data;
 
+    if (info->sink->filter_regex != NULL) {
+        pcre2_match_data* match_data =
+            pcre2_match_data_create_from_pattern(info->sink->filter_regex, NULL);
+
+        int rc = pcre2_match(info->sink->filter_regex, (const unsigned char*)name, strlen(name),
+                             0,                 /* start at offset 0 in the subject */
+                             0,                 /* default options */
+                             match_data, NULL); /* use default match context */
+
+        pcre2_match_data_free(match_data);
+
+        /* We have no matches and should skip */
+        if (rc < 0) {
+            return 0;
+        }
+    }
+
     if (json_object_size(info->jobjects[0]) > MAX_BODY_OBJECTS) {
         /* build an array size + 1 and copy in references */
         json_t** jobjects = malloc(sizeof(json_t*) * (info->jobjects_count + 1));
@@ -141,22 +158,6 @@ static int add_metrics(void* data, metric_type type, char* name, void* value) {
     json_t* obj = info->jobjects[0];
     const statsite_config* config = info->config;
 
-    if (info->sink->filter_regex != NULL) {
-        pcre2_match_data* match_data =
-            pcre2_match_data_create_from_pattern(info->sink->filter_regex, NULL);
-
-        int rc = pcre2_match(info->sink->filter_regex, (const unsigned char*)name, strlen(name),
-                             0,                 /* start at offset 0 in the subject */
-                             0,                 /* default options */
-                             match_data, NULL); /* use default match context */
-
-        pcre2_match_data_free(match_data);
-
-        /* We have a match and should do nothing */
-        if (rc > 0) {
-            return 0;
-        }
-    }
     /*
      * Scary looking macro to apply suffixes to a string, and then
      * insert them into a json object with a given value. Needs "suffixed"
