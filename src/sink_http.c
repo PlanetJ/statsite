@@ -1,27 +1,34 @@
-#include <stdio.h>
-#include <inttypes.h>
-#include <string.h>
-#include <jansson.h>
 #include <curl/curl.h>
+#include <inttypes.h>
+#include <jansson.h>
 #include <pthread.h>
-#include <unistd.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <zstd.h>
 
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+
+#include "elide.h"
 #include "lifoq.h"
 #include "metrics.h"
+#include "rand.h"
 #include "sink.h"
 #include "strbuf.h"
 #include "utils.h"
-#include "rand.h"
-#include "elide.h"
 
 const int MAX_BODY_OBJECTS = 10000;
 const int DEFAULT_WORKERS = 2;
 const useconds_t FAILURE_WAIT = 5000000; /* 5 seconds */
 
-const char* DEFAULT_CIPHERS_NSS = "ecdhe_ecdsa_aes_128_gcm_sha_256,ecdhe_rsa_aes_256_sha,rsa_aes_128_gcm_sha_256,rsa_aes_256_sha,rsa_aes_128_sha";
-const char* DEFAULT_CIPHERS_OPENSSL = "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH:DHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA";
+const char* DEFAULT_CIPHERS_NSS =
+    "ecdhe_ecdsa_aes_128_gcm_sha_256,ecdhe_rsa_aes_256_sha,rsa_aes_128_gcm_sha_"
+    "256,rsa_aes_256_sha,rsa_aes_128_sha";
+const char* DEFAULT_CIPHERS_OPENSSL =
+    "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH:DHE-RSA-AES256-SHA:DHE-"
+    "RSA-AES128-SHA";
 
 const char* USERAGENT = "statsite-http/0";
 const char* OAUTH2_GRANT = "grant_type=client_credentials";
@@ -37,8 +44,9 @@ struct http_sink {
     pthread_t* worker;
     pthread_mutex_t sink_mutex;
     char* oauth_bearer;
-    elide_t *elide;
+    elide_t* elide;
     int elide_skip;
+    pcre2_code* filter_regex;
 };
 
 /*
@@ -47,10 +55,11 @@ struct cb_info {
     json_t** jobjects;
     int jobjects_count;
 
-    elide_t *elide;
+    elide_t* elide;
     const statsite_config* config;
-    const sink_config_http *httpconfig;
+    const sink_config_http* httpconfig;
     struct timeval now;
+    struct http_sink* sink;
 };
 
 /**
@@ -82,7 +91,7 @@ static void sink_elide_refresh(struct http_sink* s) {
     }
 
     gettimeofday(&now, NULL);
-    now.tv_sec -= 60*15;
+    now.tv_sec -= 60 * 15;
     if (s->elide == NULL) {
         elide_init(&s->elide, s->elide_skip % httpconfig->elide_interval);
     } else {
@@ -116,11 +125,25 @@ static int check_elide(struct cb_info* info, char* full_name, double value) {
  * the callback will work to split the destination object and generate
  * a new one.
  */
-static int add_metrics(void* data,
-                       metric_type type,
-                       char* name,
-                       void* value) {
+static int add_metrics(void* data, metric_type type, char* name, void* value) {
     struct cb_info* info = (struct cb_info*)data;
+
+    if (info->sink->filter_regex != NULL) {
+        pcre2_match_data* match_data =
+            pcre2_match_data_create_from_pattern(info->sink->filter_regex, NULL);
+
+        int rc = pcre2_match(info->sink->filter_regex, (const unsigned char*)name, strlen(name),
+                             0,                 /* start at offset 0 in the subject */
+                             0,                 /* default options */
+                             match_data, NULL); /* use default match context */
+
+        pcre2_match_data_free(match_data);
+
+        /* We have no matches and should skip */
+        if (rc < 0) {
+            return 0;
+        }
+    }
 
     if (json_object_size(info->jobjects[0]) > MAX_BODY_OBJECTS) {
         /* build an array size + 1 and copy in references */
@@ -140,12 +163,12 @@ static int add_metrics(void* data,
      * insert them into a json object with a given value. Needs "suffixed"
      * in scope, with a "base_len" telling it how mmany chars the string is
      */
-#define SUFFIX_ADD(suf, val)                                            \
-    do {                                                                \
-        suffixed[base_len - 1] = '\0';                                  \
-        strcat(suffixed, suf);                                          \
-        json_object_set_new(obj, suffixed, val);                        \
-    } while(0)
+#define SUFFIX_ADD(suf, val)                                                                       \
+    do {                                                                                           \
+        suffixed[base_len - 1] = '\0';                                                             \
+        strcat(suffixed, suf);                                                                     \
+        json_object_set_new(obj, suffixed, val);                                                   \
+    } while (0)
 
     char* prefix = config->prefixes_final[type];
     /* Using C99 stack allocation, don't panic */
@@ -154,16 +177,14 @@ static int add_metrics(void* data,
     strcpy(full_name, prefix);
     strcat(full_name, name);
     switch (type) {
-    case GAUGE_DIRECT:
-    {
+    case GAUGE_DIRECT: {
         double gv = gauge_direct_value(value);
         if (check_elide(info, full_name, gv) == 1)
             break;
         json_object_set_new(obj, full_name, json_real(gauge_direct_value(value)));
         break;
     }
-    case GAUGE:
-    {
+    case GAUGE: {
         const int suffix_space = 8;
         char suffixed[base_len + suffix_space];
         double sum = gauge_sum(value);
@@ -177,10 +198,10 @@ static int add_metrics(void* data,
         SUFFIX_ADD(".max", json_real(gauge_max(value)));
         break;
     }
-    case COUNTER:
-    {
+    case COUNTER: {
         if (config->extended_counters) {
-            /* We allow up to 8 characters for a suffix, based on the static strings below */
+            /* We allow up to 8 characters for a suffix, based on the static
+             * strings below */
             const int suffix_space = 8;
             char suffixed[base_len + suffix_space];
             strcpy(suffixed, full_name);
@@ -200,9 +221,8 @@ static int add_metrics(void* data,
     case SET:
         json_object_set_new(obj, full_name, json_integer(set_size(value)));
         break;
-    case TIMER:
-    {
-        timer_hist *t = (timer_hist*)value;
+    case TIMER: {
+        timer_hist* t = (timer_hist*)value;
 
         double mean = timer_mean(&t->tm);
         if (check_elide(info, full_name, mean) == 1)
@@ -227,7 +247,7 @@ static int add_metrics(void* data,
              */
             to_percentile(quantile, &percentile);
             snprintf(ptile, suffix_space, ".p%d", percentile);
-            ptile[suffix_space-1] = '\0';
+            ptile[suffix_space - 1] = '\0';
             SUFFIX_ADD(ptile, json_real(timer_query(&t->tm, quantile)));
         }
         SUFFIX_ADD(".rate", json_real(timer_sum(&t->tm) / config->flush_interval));
@@ -236,11 +256,11 @@ static int add_metrics(void* data,
         if (t->conf) {
             char ptile[suffix_space];
             snprintf(ptile, suffix_space, ".bin_<%0.2f", t->conf->min_val);
-            ptile[suffix_space-1] = '\0';
+            ptile[suffix_space - 1] = '\0';
             SUFFIX_ADD(ptile, json_integer(t->counts[0]));
             for (int i = 0; i < t->conf->num_bins - 2; i++) {
-                sprintf(ptile, ".bin_%0.2f", t->conf->min_val+(t->conf->bin_width*i));
-                SUFFIX_ADD(ptile, json_integer(t->counts[i+1]));
+                sprintf(ptile, ".bin_%0.2f", t->conf->min_val + (t->conf->bin_width * i));
+                SUFFIX_ADD(ptile, json_integer(t->counts[i + 1]));
             }
             sprintf(ptile, ".bin_>%0.2f", t->conf->max_val);
             SUFFIX_ADD(ptile, json_integer(t->counts[t->conf->num_bins - 1]));
@@ -261,10 +281,8 @@ static int json_cb(const char* buf, size_t size, void* d) {
     return 0;
 }
 
-static int serialize_jobject(struct http_sink* sink,
-                            json_t* jobject,
-                            struct timeval* tv,
-                            time_t not_before) {
+static int serialize_jobject(struct http_sink* sink, json_t* jobject, struct timeval* tv,
+                             time_t not_before) {
     const sink_config_http* httpconfig = (const sink_config_http*)sink->sink.sink_config;
 
     size_t obj_size = json_object_size(jobject);
@@ -281,7 +299,9 @@ static int serialize_jobject(struct http_sink* sink,
     char* json_data = strbuf_get(json_buf, &json_len);
     json_decref(jobject);
 
-    /* Many APIs reject empty metrics lists - in this case, we simply early abort */
+    /* Many APIs reject empty metrics lists - in this case, we simply early
+     * abort
+     */
     if (json_len == 2) {
         strbuf_free(json_buf, true);
         return 0;
@@ -294,7 +314,7 @@ static int serialize_jobject(struct http_sink* sink,
     CURL* curl = curl_easy_init();
 
     /* Encode the json document as a parameter */
-    char *escaped_json_data = curl_easy_escape(curl, json_data, json_len);
+    char* escaped_json_data = curl_easy_escape(curl, json_data, json_len);
     strbuf_catsprintf(post_buf, "%s=%s", httpconfig->metrics_name, escaped_json_data);
     strbuf_free(json_buf, true);
     curl_free(escaped_json_data);
@@ -333,14 +353,14 @@ static int serialize_jobject(struct http_sink* sink,
     }
     free(post_data);
 
-    struct http_queue_entry *qe = malloc(sizeof(struct http_queue_entry));
+    struct http_queue_entry* qe = malloc(sizeof(struct http_queue_entry));
     qe->data = compressed_post_data;
     qe->not_before_backoff = not_before;
 
     int push_ret = lifoq_push(sink->queue, (void*)qe, compressed_size, true, false);
     if (push_ret) {
-        syslog(LOG_ERR, "HTTP Sink couldn't enqueue a %d size buffer - rejected code %d",
-               post_len, push_ret);
+        syslog(LOG_ERR, "HTTP Sink couldn't enqueue a %d size buffer - rejected code %d", post_len,
+               push_ret);
         free(compressed_post_data);
         free(qe);
     }
@@ -363,6 +383,7 @@ static int serialize_metrics(struct http_sink* sink, metrics* m, void* data) {
         .jobjects_count = 1,
         .config = sink->sink.global_config,
         .httpconfig = httpconfig,
+        .sink = sink,
         .now = now,
     };
 
@@ -388,7 +409,7 @@ static int serialize_metrics(struct http_sink* sink, metrics* m, void* data) {
      * local pause. Since we are using a lifoq, this means new entries
      * can establish a head of line block for requests, which is unfortunate.
      */
-    struct timeval* tv = (struct timeval*) data;
+    struct timeval* tv = (struct timeval*)data;
     time_t not_before_backoff = 0;
     if (httpconfig->send_backoff_ms > 0) {
         double random_delay = _get_random();
@@ -418,7 +439,7 @@ static int serialize_metrics(struct http_sink* sink, metrics* m, void* data) {
 /*
  * libcurl data writeback handler - buffers into a growable buffer
  */
-size_t recv_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+size_t recv_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     strbuf* buf = (strbuf*)userdata;
     /* Note: ptr is not NULL terminated, but strbuf_cat enforces a NULL */
     strbuf_cat(buf, ptr, size * nmemb);
@@ -439,10 +460,8 @@ static const char* curl_which_ssl(void) {
         return DEFAULT_CIPHERS_OPENSSL;
 }
 
-static void http_curl_basic_setup(CURL* curl,
-                                  const sink_config_http* httpconfig, struct curl_slist* headers,
-                                  char* error_buffer,
-                                  strbuf* recv_buf,
+static void http_curl_basic_setup(CURL* curl, const sink_config_http* httpconfig,
+                                  struct curl_slist* headers, char* error_buffer, strbuf* recv_buf,
                                   const char* ssl_ciphers) {
     /* Setup HTTP parameters */
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, httpconfig->time_out_seconds);
@@ -460,7 +479,7 @@ static void http_curl_basic_setup(CURL* curl,
  */
 static int oauth2_get_token(const sink_config_http* httpconfig, struct http_sink* sink) {
     char* error_buffer = malloc(CURL_ERROR_SIZE + 1);
-    strbuf *recv_buf;
+    strbuf* recv_buf;
     strbuf_new(&recv_buf, 16384);
 
     const char* ssl_ciphers;
@@ -532,7 +551,7 @@ static void* http_worker(void* arg) {
     const sink_config_http* httpconfig = (sink_config_http*)s->sink.sink_config;
 
     char* error_buffer = malloc(CURL_ERROR_SIZE + 1);
-    strbuf *recv_buf;
+    strbuf* recv_buf;
 
     const char* ssl_ciphers;
     if (httpconfig->ciphers)
@@ -547,9 +566,9 @@ static void* http_worker(void* arg) {
     syslog(LOG_NOTICE, "HTTP(%d): Starting HTTP worker", info->worker_num);
     strbuf_new(&recv_buf, 16384);
 
-    while(true) {
+    while (true) {
         struct http_queue_entry* queue_entry;
-        void *data = NULL;
+        void* data = NULL;
         size_t data_size = 0;
         int ret = lifoq_get(s->queue, (void**)&queue_entry, &data_size);
         data = queue_entry->data;
@@ -562,9 +581,11 @@ static void* http_worker(void* arg) {
             gettimeofday(&now, NULL);
             time_t delay_for = (queue_entry->not_before_backoff - now.tv_sec);
             if (delay_for > 0)
-                syslog(LOG_DEBUG, "HTTP(%d): delaying worker for %ld seconds", info->worker_num, delay_for);
+                syslog(LOG_DEBUG, "HTTP(%d): delaying worker for %ld seconds", info->worker_num,
+                       delay_for);
             while (delay_for > 0) {
-                /* Check if the queue is draining/closed, and abort sleep if needed. */
+                /* Check if the queue is draining/closed, and abort sleep if
+                 * needed. */
                 if (lifoq_is_closed(s->queue))
                     break;
                 usleep(1000000);
@@ -585,7 +606,8 @@ static void* http_worker(void* arg) {
         if (should_authenticate && s->oauth_bearer == NULL) {
             if (!oauth2_get_token(httpconfig, s)) {
                 if (lifoq_push(s->queue, (void*)queue_entry, data_size, true, true)) {
-                    syslog(LOG_ERR, "HTTP(%d): dropped data due to queue full of closed", info->worker_num);
+                    syslog(LOG_ERR, "HTTP(%d): dropped data due to queue full of closed",
+                           info->worker_num);
                     if (data != NULL)
                         free(data);
                     if (queue_entry != NULL)
@@ -613,7 +635,7 @@ static void* http_worker(void* arg) {
         /* Release the lock after all current state has been read */
         pthread_mutex_unlock(&s->sink_mutex);
 
-        memset(error_buffer, 0, CURL_ERROR_SIZE+1);
+        memset(error_buffer, 0, CURL_ERROR_SIZE + 1);
         CURL* curl = curl_easy_init();
         curl_easy_setopt(curl, CURLOPT_URL, httpconfig->post_url);
 
@@ -622,7 +644,8 @@ static void* http_worker(void* arg) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data_size);
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
 
-        syslog(LOG_DEBUG, "HTTP(%d): Sending %zd bytes to %s", info->worker_num, data_size, httpconfig->post_url);
+        syslog(LOG_DEBUG, "HTTP(%d): Sending %zd bytes to %s", info->worker_num, data_size,
+               httpconfig->post_url);
         /* Do it! */
         CURLcode rcurl = curl_easy_perform(curl);
         long http_code = 0;
@@ -640,10 +663,13 @@ static void* http_worker(void* arg) {
                     free(data);
                 if (queue_entry != NULL)
                     free(queue_entry);
-                syslog(LOG_ERR, "HTTP(%d): dropped data due to queue full of closed", info->worker_num);
+                syslog(LOG_ERR, "HTTP(%d): dropped data due to queue full of closed",
+                       info->worker_num);
             }
 
-            /* Remove any authentication token - this will cause us to get a new one */
+            /* Remove any authentication token - this will cause us to get a new
+             * one
+             */
             pthread_mutex_lock(&s->sink_mutex);
             if (s->oauth_bearer && s->oauth_bearer == last_bearer) {
                 syslog(LOG_NOTICE, "HTTP(%d): clearing Oauth bearer token", info->worker_num);
@@ -692,6 +718,22 @@ sink* init_http_sink(const sink_config_http* sc, const statsite_config* config) 
         syslog(LOG_NOTICE, "HTTP: elision generation jitter not initialized");
     }
 
+    if (sc->filter_regex != NULL) {
+        int errornumber;
+        size_t erroroffset;
+        pcre2_code* re = pcre2_compile((const unsigned char*)sc->filter_regex,
+                                       PCRE2_ZERO_TERMINATED, 0, &errornumber, &erroroffset, NULL);
+
+        if (re == NULL) {
+            PCRE2_UCHAR buffer[256];
+            pcre2_get_error_message(errornumber, buffer, sizeof(buffer));
+            syslog(LOG_ERR, "PCRE2 compilation failed at offset %d: %s\n", (int)erroroffset,
+                   buffer);
+            return NULL;
+        }
+        s->filter_regex = re;
+    }
+
     s->elide_skip = elide_generation_add % sc->elide_interval;
     if (s->elide_skip < 0)
         s->elide_skip = 0;
@@ -704,7 +746,7 @@ sink* init_http_sink(const sink_config_http* sc, const statsite_config* config) 
     syslog(LOG_NOTICE, "HTTP: using maximum queue size of %d", sc->max_buffer_size);
     lifoq_new(&s->queue, sc->max_buffer_size);
     for (int i = 0; i < DEFAULT_WORKERS; i++) {
-        struct http_worker_info *info = malloc(sizeof(struct http_worker_info));
+        struct http_worker_info* info = malloc(sizeof(struct http_worker_info));
         info->sink = s;
         info->worker_num = i;
         pthread_create(&s->worker[i], NULL, http_worker, (void*)info);

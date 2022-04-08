@@ -67,6 +67,7 @@ typedef struct sink_config_http {
     const char* oauth_key; /* OAuth2 Consumer Key */
     const char* oauth_secret; /* OAuth2 Secret */
     const char* oauth_token_url; /* URL to get a new token from */
+    const char* filter_regex; /* Regex to restrict output to things matching this regex */
     int max_buffer_size; /* LIFOQ maximum queue size */
     int send_backoff_ms; /* Fixed backoff interval for sends after de-queue */
     int time_out_seconds; /* HTTP post request timeout in seconds */

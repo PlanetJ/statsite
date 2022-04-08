@@ -90,6 +90,7 @@ static const sink_config_http DEFAULT_HTTP_SINK = {
     .oauth_key = NULL,
     .oauth_secret = NULL,
     .oauth_token_url = NULL,
+    .filter_regex = NULL,
     .max_buffer_size = 10 * 1024 * 1024, /* 10 MB */
     .send_backoff_ms = 0,
     .time_out_seconds = 30, /* HTTP post request timeout in seconds */
@@ -337,6 +338,8 @@ static int sink_callback(void* user, const char* section, const char* name, cons
             config->oauth_secret = strdup(value);
         } else if (NAME_MATCH("oauth_token_url")) {
             config->oauth_token_url = strdup(value);
+        } else if (NAME_MATCH("filter_regex")) {
+            config->filter_regex = strdup(value);
         } else if (NAME_MATCH("max_buffer_size")) {
             value_to_int(value, &config->max_buffer_size);
         } else if (NAME_MATCH("send_backoff_ms")) {
