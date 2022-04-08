@@ -141,8 +141,10 @@ static int add_metrics(void* data, metric_type type, char* name, void* value) {
 
         /* We have no matches and should skip */
         if (rc < 0) {
+            syslog(LOG_DEBUG, "Dropped non-matching metric: %s", name);
             return 0;
         }
+        syslog(LOG_DEBUG, "Passed matching metric: %s", name);
     }
 
     if (json_object_size(info->jobjects[0]) > MAX_BODY_OBJECTS) {
